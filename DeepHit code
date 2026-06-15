@@ -1,0 +1,212 @@
+import pandas as pd
+import numpy as np
+import torch
+import torchtuples as tt
+from pycox.models import DeepHit
+from pycox.preprocessing.label_transforms import LabTransDiscreteTime
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, brier_score_loss
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
+
+print("--- DEEPHIT: FINAL MANUSCRIPT PIPELINE (2-YR & 4-YR) ---")
+
+# ==========================================
+# 1. LOAD, PREPROCESS & SCALE DATA (COMPLETE CASE)
+# ==========================================
+path = "File path"
+
+# Load data
+df_train = pd.read_csv(path + 'train_set.csv')
+df_test = pd.read_csv(path + 'test_set.csv')
+
+# Handle Patient ID column name differences safely
+pid_col = 'Patient.ID' if 'Patient.ID' in df_test.columns else 'Patient ID'
+
+def preprocess_raw_seer(df):
+    df = df.copy()
+    
+    if 'Age_std' not in df.columns:
+        # Standardize continuous variables
+        df['Age_std'] = (df['Age'] - df['Age'].mean()) / df['Age'].std()
+        df['PSA_log'] = np.log1p(df['PSA'])
+        
+        # FIX: Categorize Income based on established SDoH thresholds rather than continuous scaling
+        df['Income_factor'] = pd.cut(
+            df['Income'], 
+            bins=[-np.inf, 74999, 99999, np.inf], 
+            labels=["Low (<$75k)", "Medium ($75k-$99k)", "High (≥$100k)"]
+        ).astype(str) # Cast to string to handle safely in get_dummies
+        
+        # Map other categorical SDoH and clinical factors
+        df['Race_factor'] = df['Race']
+        df['Married_factor'] = df['Married_bin']
+        df['Urban_factor'] = df['Urban_bin']
+        df['Grade_factor'] = df['GradeGroup']
+        
+        # Map ordinal text to numeric for NCCN
+        nccn_map = {'low': 1, 'intermediate': 2, 'high': 3, 'very high': 4, 'node positive': 5, 'metastatic': 6}
+        if 'NCCN' in df.columns:
+            df['NCCN_factor'] = df['NCCN'].astype(str).str.lower().map(nccn_map)
+            
+    return df
+
+df_train = preprocess_raw_seer(df_train)
+df_test = preprocess_raw_seer(df_test)
+
+cols_std = ['Age_std', 'PSA_log', 'Prostatebiopsycoredensity', 'time_dx_rx']
+cols_cat = ['Race_factor', 'Married_factor', 'Urban_factor', 'NCCN_factor', 'Grade_factor', 'Income_factor']
+
+# STRICT COMPLETE CASE ANALYSIS: Drop NAs
+df_train = df_train.dropna(subset=cols_std + cols_cat + ['time', 'CompetingRisk_outcome']).copy()
+df_test = df_test.dropna(subset=cols_std + cols_cat + ['time', 'CompetingRisk_outcome', pid_col]).copy()
+
+print(f"Data after complete-case NA drop -> Train: {len(df_train)} rows, Test: {len(df_test)} rows")
+
+# Convert categorical factors to dummy variables for the neural network
+X_train_df = pd.get_dummies(df_train[cols_std + cols_cat], drop_first=True, columns=cols_cat)
+X_test_df = pd.get_dummies(df_test[cols_std + cols_cat], drop_first=True, columns=cols_cat)
+
+# Ensure columns align perfectly between train and test after get_dummies
+X_train_df, X_test_df = X_train_df.align(X_test_df, join='left', axis=1, fill_value=0)
+
+# SCALE: Stabilize the deep learning math
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train_df).astype(np.float32)
+X_test = scaler.transform(X_test_df).astype(np.float32)
+
+labtrans = LabTransDiscreteTime(100)
+get_target = lambda df: (df['time'].values, df['CompetingRisk_outcome'].values)
+
+y_train_raw = labtrans.fit_transform(*get_target(df_train))
+y_test_raw = labtrans.transform(*get_target(df_test))
+
+y_train = (y_train_raw[0].astype(np.int64), y_train_raw[1].astype(np.int64))
+y_test = (y_test_raw[0].astype(np.int64), y_test_raw[1].astype(np.int64))
+
+# ==========================================
+# 2. TRAIN THE NEURAL NETWORK & SAVE PIPELINE
+# ==========================================
+class CauseSpecificNet(torch.nn.Module):
+    def __init__(self, in_features, num_nodes, out_bins, num_risks):
+        super().__init__()
+        self.mlp = tt.practical.MLPVanilla(
+            in_features=in_features, 
+            num_nodes=num_nodes, 
+            out_features=out_bins * num_risks, 
+            batch_norm=True, 
+            dropout=0.1
+        )
+        self.out_bins, self.num_risks = out_bins, num_risks
+    def forward(self, input):
+        return self.mlp(input).view(-1, self.num_risks, self.out_bins)
+
+print("\nTraining Model (Batch Size 2048)...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using compute device: {device}")
+
+net = CauseSpecificNet(X_train.shape[1], [32, 32], 100, 3).to(device)
+model = DeepHit(net, tt.optim.Adam, alpha=0.2, sigma=0.1)
+
+callbacks = [tt.callbacks.EarlyStopping(patience=5)]
+model.fit(X_train, y_train, batch_size=2048, epochs=100, callbacks=callbacks, verbose=True, val_data=(X_test, y_test))
+
+# -> CRITICAL: SAVE THE ENTIRE PIPELINE FOR SHAP & APP DEPLOYMENT <-
+model_path = path + 'deephit_final_model.pt'
+model.save_net(model_path)
+
+pipeline_artifacts = {
+    'scaler': scaler,
+    'labtrans': labtrans,
+    'features': list(X_train_df.columns)
+}
+joblib.dump(pipeline_artifacts, path + 'deephit_pipeline_artifacts.pkl')
+
+print(f"\nModel securely saved to: {model_path}")
+print(f"Pipeline artifacts (Scaler/Features) saved to: {path}deephit_pipeline_artifacts.pkl")
+
+# ==========================================
+# 3. ROBUST 2-YR & 4-YR BOOTSTRAPPING
+# ==========================================
+def robust_bootstrap_2yr_4yr(model, X, df_true, name, n_iterations=100):
+    print(f"\n--- Running 100 Bootstraps for {name} (2-Yr & 4-Yr) ---")
+    
+    cif_preds = model.predict_cif(X)[0] # Cause 1: Prostate Cancer Specific Mortality
+    
+    # 24 Months and 48 Months (4 Years)
+    idx_24 = np.abs(labtrans.cuts - 24).argmin()
+    idx_48 = np.abs(labtrans.cuts - 48).argmin()
+    
+    risk_2yr_all = cif_preds[idx_24, :]
+    risk_4yr_all = cif_preds[idx_48, :]
+    
+    times_all = df_true['time'].values
+    events_all = df_true['CompetingRisk_outcome'].values
+    n_samples = len(X)
+    
+    auc_2yr_list, brier_2yr_list = [], []
+    auc_4yr_list, brier_4yr_list = [], []
+    
+    for i in range(n_iterations):
+        if (i + 1) % 10 == 0: 
+            print(f"  ...completed {i + 1}/{n_iterations} iterations")
+            
+        idx = np.random.choice(n_samples, n_samples, replace=True)
+        
+        times = times_all[idx]
+        events = events_all[idx]
+        risk_2yr = risk_2yr_all[idx]
+        risk_4yr = risk_4yr_all[idx]
+        
+        # 2-YEAR METRICS
+        valid_2yr = (times > 24) | (events != 0)
+        if valid_2yr.sum() > 0:
+            y_true_2yr = np.where((times <= 24) & (events == 1), 1, 0)[valid_2yr]
+            y_pred_2yr = risk_2yr[valid_2yr]
+            auc_2yr_list.append(roc_auc_score(y_true_2yr, y_pred_2yr))
+            brier_2yr_list.append(brier_score_loss(y_true_2yr, y_pred_2yr))
+            
+        # 4-YEAR METRICS
+        valid_4yr = (times > 48) | (events != 0)
+        if valid_4yr.sum() > 0:
+            y_true_4yr = np.where((times <= 48) & (events == 1), 1, 0)[valid_4yr]
+            y_pred_4yr = risk_4yr[valid_4yr]
+            auc_4yr_list.append(roc_auc_score(y_true_4yr, y_pred_4yr))
+            brier_4yr_list.append(brier_score_loss(y_true_4yr, y_pred_4yr))
+
+    calc_stats = lambda arr: (np.nanmean(arr), np.nanpercentile(arr, 2.5), np.nanpercentile(arr, 97.5)) if len(arr) > 0 else (np.nan, np.nan, np.nan)
+    
+    a2_m, a2_l, a2_u = calc_stats(auc_2yr_list)
+    b2_m, b2_l, b2_u = calc_stats(brier_2yr_list)
+    
+    a4_m, a4_l, a4_u = calc_stats(auc_4yr_list)
+    b4_m, b4_l, b4_u = calc_stats(brier_4yr_list)
+    
+    print(f"\n===== {name} FINAL RESULTS =====")
+    print(f"2-Year AUC (C-Index):  {a2_m:.4f} (95% CI: {a2_l:.4f} - {a2_u:.4f})")
+    print(f"2-Year Brier Score:    {b2_m:.4f} (95% CI: {b2_l:.4f} - {b2_u:.4f})")
+    print("-" * 40)
+    print(f"4-Year AUC (C-Index):  {a4_m:.4f} (95% CI: {a4_l:.4f} - {a4_u:.4f})")
+    print(f"4-Year Brier Score:    {b4_m:.4f} (95% CI: {b4_l:.4f} - {b4_u:.4f})")
+
+# Run Evaluation
+robust_bootstrap_2yr_4yr(model, X_train, df_train, "TRAINING SET", 100)
+robust_bootstrap_2yr_4yr(model, X_test, df_test, "TESTING SET", 100)
+
+# ==========================================
+# 4. EXPORT PREDICTIONS
+# ==========================================
+print("\n--- Exporting Predictions for R ---")
+cif_test = model.predict_cif(X_test)[0]
+idx_24 = np.abs(labtrans.cuts - 24).argmin()
+idx_48 = np.abs(labtrans.cuts - 48).argmin()
+
+results_df = pd.DataFrame({
+    'Patient_ID': df_test[pid_col],
+    'DeepHit_Risk_2yr': cif_test[idx_24, :],
+    'DeepHit_Risk_4yr': cif_test[idx_48, :]
+})
+export_path = path + 'DeepHit_Predictions_2y_4y.csv'
+results_df.to_csv(export_path, index=False)
+print(f"Saved 2-year and 4-year predictions to: {export_path}")
