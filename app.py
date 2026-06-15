@@ -5,7 +5,7 @@ import plotly.express as px
 
 # --- 1. PAGE CONFIGURATION & MODERN THEMING ---
 st.set_page_config(
-    page_title="PROSPER AI nomogram (Prostate Social & Pathological Equity Stratifier)",
+    page_title="Prostate DeepHit nomogram ",
     page_icon="⚕️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -46,7 +46,7 @@ st.markdown("""
 # --- 2. APP HEADER ---
 st.markdown("""
     <div class="main-header">
-        <h1 style="color: #0c3c61; margin-bottom: 5px;">PROSPER</h1>
+        <h1 style="color: #0c3c61; margin-bottom: 5px;">Prostate DeepHit Calculator</h1>
         <p style="color: #555; font-size: 1.2em; margin-top: 0px;">Prostate Social & Pathological Equity Stratifier</p>
         <div style="background-color: #fff3f3; color: #b71c1c; padding: 10px; border-radius: 5px; font-weight: bold; border: 1px solid #ffcdd2; display: inline-block; margin-top: 5px;">
             ⚠️ RESEARCH USE ONLY | No Patient-Identifiable Information (PII) Stored Locally
@@ -201,11 +201,11 @@ with foot_col1:
 with foot_col2:
     st.markdown("### 🔒 Data Architecture & Governance Compliance")
     st.caption("""
-        **Privacy Safeguard Statement:** PROSPER functions entirely within local client runtime parameters. 
+        **Privacy Safeguard Statement:** Calculator functions entirely within local client runtime parameters. 
         No inputs, configurations, or patient profiles are transmitted via network protocol, indexed globally, or 
         cached in cloud architecture. Data mappings are grounded exclusively in de-identified patient populations 
         harvested from the National Cancer Institute's Surveillance, Epidemiology, and End Results (SEER) 
         database spanning 2010 to 2022.
     """)
 
-st.markdown("<center style='color: #888; font-size: 0.85em; margin-top: 15px;'>PROSPER 2026</center>", unsafe_allow_html=True)
+st.markdown("<center style='color: #888; font-size: 0.85em; margin-top: 15px;'>Calculator 2026</center>", unsafe_allow_html=True)
